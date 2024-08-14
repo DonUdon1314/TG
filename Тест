@@ -1,0 +1,392 @@
+from typing import Any
+import uuid
+
+from aiogram import Router, Bot, F, html
+from aiogram.types import CallbackQuery, Message
+from aiogram.fsm.scene import Scene, on
+from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramBadRequest
+
+from bot.keyboards import testing_markup, test_history_markup
+from bot.keyboards import TestingFactory
+from bot.utils import display_answers
+
+from db import Test, Question, User, Role, Goal, GoalType
+
+
+class CreateTest(Scene, state="create_test"):
+
+    @on.callback_query.enter()
+    @on.message.enter()
+    async def on_enter(
+        self,
+        query: CallbackQuery | Message,
+        state: FSMContext,
+        bot: Bot,
+        step: int | None = None,
+        page: int = 1
+    ) -> Any:
+        if step is None:
+            msg = await query.message.edit_text(
+                f"<b>Название:</b> ...\n<b>Вопрос <code>#{page}</code>:</b> ...",
+                reply_markup=testing_markup(2, [1, 2, 1, 1, 1, 2], 1)
+            )
+            unique_test_id = uuid.uuid4()
+
+            await Test.create(id=unique_test_id)
+            return await state.update_data(msgid=msg.message_id, uid=unique_test_id, page=page)
+        await state.update_data(step=step, page=page)
+
+        data = await state.get_data()
+        name = data.get("name", None)
+        question = data.get("question", None)
+        answers = data.get("answers", {})
+        terms = data.get("terms", None)
+
+        formatted_answers = "\n".join(
+            f"{'🔴' if not answers[k]['is_correct'] else '🟢'} | {answers[k]['ans']}"
+            for k, _ in answers.items()
+        )
+        pattern = {
+            "text": (
+                f"<b>Название:</b> {name or '...'}\n"
+                f"<b>Вопрос <code>#{page}</code>:</b> {question or '...'}\n{formatted_answers}\n\n"
+            ),
+            "reply_markup": testing_markup(2, [1, 2, 1, 1, 1, 2], page)
+        }
+
+        match step:
+            case 1:
+                pattern["text"] += "<blockquote>Придумайте новое название для теста</blockquote>"
+            case 2:
+                pattern["text"] += "<blockquote>Придумайте вопрос</blockquote>"
+            case 3:
+                pattern["text"] += "<blockquote>Придумайте ответ</blockquote>"
+            case 4:
+                if not answers:
+                    return await query.answer("Нет ответов для помечания", show_alert=True)
+
+                pattern["text"] += "<blockquote>Отметьте верные ответы</blockquote>"
+                pattern["reply_markup"] = testing_markup(
+                    3, data=[f"{k}:{answers[k]['is_correct']}" for k, _ in answers.items()]
+                )
+            case 5:
+                formatted_terms = "\n".join(
+                    f"За <code>{q}</code> верных ответов - <code>{a}</code> <i>анонимов</i>"
+                    for q, a in terms.items()
+                ) if terms else "..."
+
+                pattern["text"] = (
+                    "<b>Рассчет условий теста</b>\n"
+                    "<i>Введите данные в следующем формате:</i>\n"
+                    "<blockquote><b>Кол-во верных вопросов - кол-во анонимов</b>\n"
+                    f"Пример:\n10 - 10\n5 - 3\n2 - 1</blockquote>\n\n{formatted_terms}"
+                )
+                pattern["reply_markup"] = testing_markup(only_back=True)
+            case 6:
+                return await self.wizard.exit()
+            case 7:
+                if not name:
+                    return await query.answer("Тест должен иметь название", show_alert=True)
+
+                all_questions = await Question.filter(test_id=data["uid"]).all()
+                if not all_questions or len(all_questions) < 2:
+                    return await query.answer(
+                        "Тест должен иметь вопросы и не менее двух", show_alert=True
+                    )
+
+                for qa in all_questions:
+                    if not qa.question:
+                        return await query.answer(
+                            f"В вопросе #{qa.question_id} отсутствует название", show_alert=True
+                        )
+                    if not any(ans['is_correct'] == 1 for ans in qa.answers.values()):
+                        return await query.answer(
+                            f"В вопросе #{qa.question_id} не выбраны верные ответы", show_alert=True
+                        )
+                    if not terms:
+                        return await query.answer("Отсутствуют условия теста", show_alert=True)
+
+                await Test.filter(id=data["uid"]).update(
+                    name=name, terms=terms, total=len(all_questions)
+                )
+                return await self.wizard.exit()
+
+        try:
+            return await bot.edit_message_text(
+                chat_id=query.from_user.id,
+                message_id=data["msgid"],
+                **pattern
+            )
+        except TelegramBadRequest:
+            return await query.answer()
+
+    @on.callback_query.exit()
+    async def on_exit(self, query: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        action = data.get("action", None)
+        markup = None
+
+        if action == "finish":
+            markup = testing_markup(4, data=data["uid"])
+            msg = "🧪 Вы успешно создали новый тест\nВыберите кассира, чтобы отправить ему тест"
+        else:
+            msg = "❌ Вы отменили создание теста"
+            await Test.filter(id=data["uid"]).delete()
+
+        await query.message.edit_text(msg, reply_markup=markup)
+        await state.clear()
+
+    @on.callback_query(TestingFactory.filter(F.value == "prev-question"))
+    async def prev_question(self, query: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        uid = data["uid"]
+        prev_page = data["page"] - 1
+        question = data.get("question", None)
+        answers = data.get("answers", {})
+
+        if question or answers:
+            exists_question = await Question.get_or_none(test_id=uid, question_id=data["page"])
+            if not exists_question:
+                test_model = await Test.filter(id=uid).first()
+                await Question.create(
+                    question_id=data["page"],
+                    question=question,
+                    answers=answers,
+                    test=test_model
+                )
+            else:
+                if exists_question.question != question:
+                    exists_question.question = question
+                    await exists_question.save()
+                if exists_question.answers != answers:
+                    exists_question.answers = answers
+                    await exists_question.save()
+
+        question_model = await Question.filter(test_id=uid, question_id=prev_page).first()
+        await state.update_data(
+            question=question_model.question, answers=question_model.answers, action=None
+        )
+        await self.wizard.retake(step=0, page=prev_page)
+
+    @on.callback_query(TestingFactory.filter(F.value == "next-question"))
+    async def next_question(self, query: CallbackQuery, state: FSMContext) -> Any:
+        data = await state.get_data()
+        next_page = data["page"] + 1
+
+        exists_question = await Question.filter(
+            test_id=data["uid"], question_id=next_page
+        ).first()
+        if exists_question:
+            await state.update_data(
+                question=exists_question.question, answers=exists_question.answers, action=None
+            )
+            return await self.wizard.retake(step=0, page=next_page)
+
+        question = data.get("question", None)
+        answers = data.get("answers", {})
+
+        if len(answers) < 2:
+            return await query.answer("Ответов должно быть не менее двух", show_alert=True)
+        if not question:
+            return await query.answer("Отсутствует вопрос", show_alert=True)
+        if not any(ans['is_correct'] == 1 for ans in answers.values()):
+            return await query.answer(
+                "Как минимум один ответ должен быть верным", show_alert=True
+            )
+
+        current_question = await Question.exists(test_id=data["uid"], question_id=data["page"])
+        if not current_question:
+            test_model = await Test.filter(id=data["uid"]).first()
+            await Question.create(
+                question_id=data["page"],
+                question=data["question"],
+                answers=data["answers"],
+                test=test_model
+            )
+
+        await state.update_data(question=None, action=None, answers={})
+        return await self.wizard.retake(step=0, page=data["page"] + 1)
+
+    @on.callback_query(TestingFactory.filter(F.value))
+    async def actions_handler(self, query: CallbackQuery, state: FSMContext) -> None:
+        action = query.data.split(":")[-1]
+        data = await state.get_data()
+
+        match action:
+            case "change-name": step = 1
+            case "add-question": step = 2
+            case "add-answer": step = 3
+            case "select-true": step = 4
+            case "terms": step = 5
+            case "cancel": step = 6
+            case "finish": step = 7
+            case "back": step = 0
+
+        await state.update_data(action=action)
+        await self.wizard.retake(step=step, page=data["page"])
+
+    @on.callback_query(F.data.startswith("quest"))
+    async def change_question_mark(self, query: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        answers = data["answers"]
+        name = data.get("name", "...")
+        question = data.get("question", "...")
+
+        try: answer = answers[int(query.data.split(":")[-1])]
+        except KeyError: answer = answers[query.data.split(":")[-1]]
+
+        answer["is_correct"] = 1 if not answer["is_correct"] else 0
+        formatted_answers = "\n".join(
+            f"{'🔴' if not answers[k]['is_correct'] else '🟢'} | {answers[k]['ans']}"
+            for k, _ in answers.items()
+        )
+
+        await query.message.edit_text(
+            f"<b>Название:</b> {name}\n"
+            f"<b>Вопрос: <code>#{data['page']}</code></b> {question}\n{formatted_answers}\n\n"
+            "<blockquote>Пометьте верные ответы</blockquote>",
+            reply_markup=testing_markup(
+                3, data=[f"{k}:{answers[k]['is_correct']}" for k, _ in answers.items()]
+            )
+        )
+
+    @on.message(F.text)
+    async def process_action(self, message: Message, state: FSMContext) -> Any:
+        data = await state.get_data()
+        action = data.get("action", None)
+
+        safe_text = html.quote(message.text)
+        save_step = False
+
+        match action:
+            case "change-name":
+                if len(safe_text) > 250:
+                    return await message.delete()
+                await state.update_data(name=safe_text, action=None)
+            case "add-question":
+                if len(safe_text) > 250:
+                    return await message.delete()
+                await state.update_data(question=safe_text, action=None)
+            case "add-answer":
+                if len(safe_text) > 250:
+                    return await message.delete()
+
+                answers = data.get("answers", {})
+                next_answer_id = len(answers) + 1
+                answers[next_answer_id] = {"ans": safe_text, "is_correct": 0}
+                save_step = True
+
+                await state.update_data(answers=answers)
+            case "terms":
+                try:
+                    current_terms = data.get("terms", {})
+                    q_count, a_count = safe_text.split("-")
+
+                    all_questions = await Question.filter(test_id=data["uid"]).all()
+                    total_answers = sum(len(question.answers) for question in all_questions)
+
+                    if int(q_count) > total_answers or int(q_count) <= 0:
+                        return await message.delete()
+                    if int(a_count) > 10_000:
+                        return await message.delete()
+
+                    current_terms[q_count.strip()] = a_count.strip()
+                    save_step = True
+                    await state.update_data(terms=current_terms)
+                except ValueError:
+                    return await message.delete()
+            case _:
+                return await message.delete()
+
+        await message.delete()
+        return await self.wizard.retake(
+            step=0 if not save_step else data["step"], page=data["page"]
+        )
+
+
+class TestHistory(Scene, state="test_history"):
+
+    @on.callback_query.enter()
+    async def on_enter(
+        self,
+        query: CallbackQuery,
+        state: FSMContext,
+        offset: int | str | None = None,
+        user: User | None = None
+    ) -> Any:
+        if offset is None or user:
+            if not user:
+                await query.message.edit_text(
+                    "Выберите кассира", reply_markup=test_history_markup(0)
+                )
+                return await state.update_data(as_user=False)
+            await state.update_data(as_user=True, cashier=user)
+            return await self.wizard.retake(offset="select_test")
+        if offset == "select_test":
+            data = await state.get_data()
+            as_user = data["as_user"]
+            cashier = data["cashier"]
+
+            all_tests = await Goal.filter(
+                type=GoalType.TEST, user=cashier
+            ).all().order_by("-created_at")
+            if not all_tests:
+                return await query.answer("Пока истории нет...")
+
+            tests = await Test.in_bulk([at.goal_id for at in all_tests])
+            formatted_tests = "\n".join(
+                f"<blockquote>{i}. <b>{test.name}</b> (<code>{test.total}</code>)</blockquote>"
+                for i, test in enumerate(tests.values(), start=1)
+            )
+
+            return await query.message.edit_text(
+                f"{formatted_tests}\n<blockquote>Выберите тест</blockquote>",
+                reply_markup=test_history_markup(data=tests, extra=as_user)
+            )
+
+        data = await state.get_data()
+        as_user = data["as_user"]
+        cashier = data["cashier"]
+        test_id = data["test_id"]
+
+        goal = await Goal.filter(
+            goal_id=test_id, user=cashier
+        ).offset(offset).only("answers").first()
+        questions = await Question.filter(
+            test_id=test_id
+        ).offset(offset).only("question", "answers").all()
+        
+        question_answers = [q.answers for q in questions]
+        formatted_answers = "\n".join(display_answers(question_answers, goal.answers))
+
+        await state.update_data(offset=offset)
+        return await query.message.edit_text(
+            f"{formatted_answers}",
+            reply_markup=test_history_markup(2, data=offset, extra=as_user)
+        )
+
+    @on.callback_query(TestingFactory.filter(F.value.startswith("t_")))
+    async def current_test(self, query: CallbackQuery, state: FSMContext) -> None:
+        test_id = query.data.split("_")[-1]
+        await state.update_data(test_id=test_id)
+        await self.wizard.retake(offset=0)
+        
+    @on.callback_query(TestingFactory.filter(F.value.startswith("cs_")))
+    async def select_cashier(self, query: CallbackQuery, state: FSMContext) -> Any:
+        cashier_id = query.data.split("_")[-1]
+        cashier = await User.filter(role=Role.get_role(cashier_id)).first()
+
+        if not cashier:
+            return await query.answer("Кассир не найден")
+        await state.update_data(cashier=cashier)
+        return await self.wizard.retake(offset="select_test")
+
+
+router = Router()
+router.callback_query.register(
+    CreateTest.as_handler(), TestingFactory.filter(F.action == "create")
+)
+router.callback_query.register(
+    TestHistory.as_handler(), TestingFactory.filter(F.action == "history")
+)
